@@ -513,20 +513,23 @@ const KNOWN_METADATA_VERSIONS = [24.0, 24.1, 24.2, 24.3, 24.4, 24.5, 27, 27.1, 2
 
 const HEADER_PROBE_PAIRS = 20; // pairs 0..19 are at fixed positions in every version 24-31
 
-function scoreHeaderCandidate(dv, c) {
+function scoreHeaderCandidate(dv, c, loose) {
   const fileSize = dv.byteLength;
   const slOff = dv.getUint32(c + 8, true);
-  if (slOff === undefined || slOff < c + 160 || slOff >= fileSize) return -1;
+  if (slOff === undefined || slOff < c + 152 || slOff >= fileSize) return -1;
   let prevEnd = slOff;
   let score = 12;
   for (let i = 0; i < HEADER_PROBE_PAIRS; i++) {
     const o = dv.getUint32(c + 8 + i * 8, true);
     const s = dv.getInt32(c + 8 + i * 8 + 4, true);
-    if (o === undefined || s === undefined || s < 0 || o < prevEnd || o + s > fileSize) return -1;
+    if (o === undefined || s === undefined || s < 0 || o < slOff || o + s > fileSize) return -1;
+    if (loose) continue;
+    if (o < prevEnd) return -1;
     score += 2;
     if (o - prevEnd <= 4) score += 1;
     prevEnd = o + s;
   }
+  if (loose) score += HEADER_PROBE_PAIRS;
   const slSize = dv.getInt32(c + 8 + 4, true);
   if (slSize >= 0 && slSize % 8 === 0) score += 3;
   const methodsSize = dv.getInt32(c + 8 + 5 * 8 + 4, true);
@@ -569,35 +572,81 @@ function determineVersionByStructure(dv, headerOff) {
   return best === null ? null : { version: best, fromWord: false };
 }
 
-function locateHeaderByStructure(dv, warnings) {
-  const fileSize = dv.byteLength;
-  if (fileSize < 512) return null;
+function scanStructuralHeader(u8, fileSize, opts) {
+  const step = opts && opts.step ? opts.step : 1;
   let best = null;
   let bestScore = 0;
-  for (let p = 0; p + 4 <= fileSize; p += 4) {
-    const v = dv.getUint32(p, true);
-    if (v < 160 || v >= fileSize) continue;
+  let validated = 0;
+  const maxValid = opts && opts.maxValid ? opts.maxValid : 20000;
+  for (let p = 0; p + 4 <= fileSize; p += step) {
+    const v = u8[p] | (u8[p + 1] << 8) | (u8[p + 2] << 16) | ((u8[p + 3] << 24) >>> 0);
+    if (v < p + 152 || v > p + 408) continue; // header end must sit in a plausible header-size window
     const c = p - 8;
     if (c < 0 || c + 8 + HEADER_PROBE_PAIRS * 8 > fileSize) continue;
-    const methodsSize = dv.getInt32(c + 8 + 5 * 8 + 4, true);
-    const tdSize = dv.getInt32(c + 8 + 19 * 8 + 4, true);
-    if (!(methodsSize > 0) || !(tdSize > 0)) continue;
-    const score = scoreHeaderCandidate(dv, c);
+    const mSize = ((u8[c + 52] | (u8[c + 53] << 8) | (u8[c + 54] << 16) | ((u8[c + 55] << 24) >>> 0)) | 0);
+    const tdSize = ((u8[c + 164] | (u8[c + 165] << 8) | (u8[c + 166] << 16) | ((u8[c + 167] << 24) >>> 0)) | 0);
+    if (mSize <= 0 || tdSize <= 0) continue;
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const score = scoreHeaderCandidate(dv, c, !!(opts && opts.loose));
+    validated++;
     if (score > bestScore) {
       bestScore = score;
       best = c;
     }
     if (score > 60) break;
+    if (validated > maxValid) break;
   }
-  if (best === null) return null;
-  const det = determineVersionByStructure(dv, best);
+  const minScore = opts && opts.minScore ? opts.minScore : 0;
+  if (best !== null && bestScore < minScore) best = null;
+  return { off: best, score: bestScore, validated };
+}
+
+function locateHeaderByStructure(dv, warnings) {
+  const fileSize = dv.byteLength;
+  if (fileSize < 512) return null;
+  const u8 = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+  let found = scanStructuralHeader(u8, fileSize, { loose: false });
+  if (found.off === null) {
+    found = scanStructuralHeader(u8, fileSize, { loose: true, minScore: 30 });
+  }
+  if (found.off === null) {
+    warnings.push(`Structural scan checked ${found.validated} header-like positions but found no valid layout — the metadata structure is likely modified, reordered, or encrypted.`);
+    return null;
+  }
+  const det = determineVersionByStructure(dv, found.off);
   warnings.push('Metadata header located by structure — the magic bytes are missing (obfuscated/stripped file).');
   if (det === null) {
     warnings.push('Could not determine the metadata version from the stripped header; defaulting to v29 (2021.x) layout.');
-    return { headerOff: best, version: 29, magic: 0, stripped: true, versionFromWord: false };
+    return { headerOff: found.off, version: 29, magic: 0, stripped: true, versionFromWord: false };
   }
   if (!det.fromWord) warnings.push(`Metadata version ${det.version} determined from the stripped header layout.`);
-  return { headerOff: best, version: det.version, magic: 0, stripped: true, versionFromWord: det.fromWord };
+  return { headerOff: found.off, version: det.version, magic: 0, stripped: true, versionFromWord: det.fromWord };
+}
+
+function tryDecryptSingleByteXor(dv) {
+  const u8 = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+  const len = u8.length;
+  if (len < 512) return null;
+  const probeLen = Math.min(len, 32768);
+  const scratch = new Uint8Array(probeLen);
+  for (let key = 1; key < 256; key++) {
+    for (let i = 0; i < probeLen; i++) scratch[i] = u8[i] ^ key;
+    // 1) look for the real magic anywhere in the decrypted prefix
+    let hit = false;
+    for (let off = 0; off + 4 <= probeLen; off++) {
+      if (scratch[off] === 0xaf && scratch[off + 1] === 0x1b && scratch[off + 2] === 0xb1 && scratch[off + 3] === 0xfa) { hit = true; break; }
+    }
+    if (!hit) {
+      // 2) look for a valid header structure in the decrypted prefix
+      const res = scanStructuralHeader(scratch, probeLen, { loose: true, maxValid: 4000, minScore: 30 });
+      if (res.off !== null) hit = true;
+    }
+    if (!hit) continue;
+    const out = new Uint8Array(len);
+    for (let i = 0; i < len; i++) out[i] = u8[i] ^ key;
+    return { buffer: out.buffer, key };
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -606,16 +655,26 @@ function locateHeaderByStructure(dv, warnings) {
 
 export function analyzeMetadata({ metadata, binary }) {
   const warnings = new WarningCollector();
-  const mdv = new DataView(metadata);
+  let buffer = metadata;
+  let mdv = new DataView(buffer);
 
   let probe = locateHeader(mdv, warnings);
   if (!probe) {
     probe = locateHeaderByStructure(mdv, warnings);
   }
   if (!probe) {
+    const dec = tryDecryptSingleByteXor(mdv);
+    if (dec) {
+      warnings.push(`Metadata file was XOR-encrypted (single-byte key 0x${dec.key.toString(16)}); decrypted in memory.`);
+      buffer = dec.buffer;
+      mdv = new DataView(buffer);
+      probe = locateHeader(mdv, warnings) || locateHeaderByStructure(mdv, warnings);
+    }
+  }
+  if (!probe) {
     return {
       ok: false,
-      error: 'Could not locate the global-metadata header. The file may be corrupt, encrypted, or not a Unity global-metadata.dat.',
+      error: 'Could not locate the global-metadata header. Tried magic scan, structural scan, and all 255 single-byte XOR keys. The file is likely fully encrypted, compressed, or not a Unity global-metadata.dat.',
       warnings: warnings.get(),
     };
   }
@@ -633,7 +692,7 @@ export function analyzeMetadata({ metadata, binary }) {
     versionLabel: versionLabel(vf),
     headerOffset: headerOff,
     headerSize,
-    fileSize: metadata.byteLength,
+    fileSize: buffer.byteLength,
     preHeaderBytes: headerOff,
   };
 
@@ -649,7 +708,7 @@ export function analyzeMetadata({ metadata, binary }) {
     const size = sections[sizeField];
     if (off === undefined || size === undefined || off < 0 || size < 0) return { valid: false };
     const end = off + size;
-    if (off < headerOff || end > metadata.byteLength) {
+    if (off < headerOff || end > buffer.byteLength) {
       warnings.push(`Section ${name} is out of bounds (offset ${off}, size ${size}).`);
       return { valid: false };
     }
