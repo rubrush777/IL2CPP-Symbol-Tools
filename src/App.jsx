@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback } from "react";
+import { analyzeMetadata } from "./metadataDumper.js";
 
 // ─── ELF Parser ──────────────────────────────────────────────────────────────
 function parseELFSymbols(buffer) {
@@ -275,6 +276,36 @@ const css = `
   ::-webkit-scrollbar { width: 6px; height: 6px; }
   ::-webkit-scrollbar-track { background: ${palette.bg}; }
   ::-webkit-scrollbar-thumb { background: ${palette.border}; border-radius: 3px; }
+  .dumper-tabs { display: flex; gap: 4px; border-bottom: 1px solid ${palette.border}; margin-bottom: 12px; overflow-x: auto; }
+  .dumper-tab {
+    padding: 8px 14px; font-size: 13px; font-weight: 500; cursor: pointer;
+    color: ${palette.muted}; border: none; background: none; font-family: 'Inter', sans-serif;
+    border-bottom: 2px solid transparent; white-space: nowrap;
+  }
+  .dumper-tab:hover { color: ${palette.text}; }
+  .dumper-tab.active { color: ${palette.accent}; border-bottom-color: ${palette.accent}; }
+  .dump-view {
+    background: #0a0c0f; border: 1px solid ${palette.border}; border-radius: 8px;
+    padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    line-height: 1.6; color: ${palette.text}; max-height: 560px; overflow: auto;
+    white-space: pre; word-break: break-all;
+  }
+  .stat-box {
+    background: ${palette.surface}; border: 1px solid ${palette.border}; border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .stat-label { font-size: 11px; color: ${palette.muted}; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+  .stat-value { font-size: 18px; font-weight: 600; color: ${palette.text}; font-family: 'JetBrains Mono', monospace; }
+  .file-chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: ${palette.surface}; border: 1px solid ${palette.border}; border-radius: 8px;
+    padding: 8px 14px; font-size: 13px; color: ${palette.text}; cursor: pointer;
+  }
+  .file-chip:hover { border-color: ${palette.accent}; }
+  .warning-box {
+    background: #241a08; border: 1px solid #4a3a10; border-radius: 8px; padding: 12px 16px;
+    font-size: 13px; color: #e0c068; font-family: 'JetBrains Mono', monospace; line-height: 1.6;
+  }
 `;
 
 // ─── Pages ────────────────────────────────────────────────────────────────────
@@ -308,6 +339,21 @@ function HomePage({ onNav }) {
           </div>
           <p style={{ fontWeight: 600, fontSize: 15, color: palette.text, marginBottom: 6 }}>symbol getter</p>
           <p style={{ fontSize: 13, color: palette.muted, lineHeight: 1.5 }}>get the symbols from libil2cpp.so</p>
+        </button>
+
+        <button
+          onClick={() => onNav("metadata")}
+          style={{ background: palette.card, border: `1px solid ${palette.border}`, borderRadius: 12, padding: "28px 24px", cursor: "pointer", textAlign: "left", transition: "all 0.2s" }}
+          onMouseEnter={e => { e.currentTarget.style.borderColor = palette.green; e.currentTarget.style.background = "#151e17"; }}
+          onMouseLeave={e => { e.currentTarget.style.borderColor = palette.border; e.currentTarget.style.background = palette.card; }}
+        >
+          <div style={{ width: 36, height: 36, borderRadius: 8, background: palette.greenDim, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 16 }}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={palette.green} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+            </svg>
+          </div>
+          <p style={{ fontWeight: 600, fontSize: 15, color: palette.text, marginBottom: 6 }}>metadata dumper</p>
+          <p style={{ fontSize: 13, color: palette.muted, lineHeight: 1.5 }}>dump global-metadata.dat — types, methods, strings, addresses</p>
         </button>
 
         <button
@@ -588,6 +634,172 @@ function FridaPatcher({ onBack }) {
   );
 }
 
+function MetadataDumper({ onBack }) {
+  const [status, setStatus] = useState("idle"); // idle | loading | done | error
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null);
+  const [tab, setTab] = useState("dump");
+  const [metaName, setMetaName] = useState("");
+  const [binName, setBinName] = useState("");
+  const metaRef = useRef();
+  const binRef = useRef();
+
+  const metaBufRef = useRef(null);
+  const binBufRef = useRef(null);
+
+  const pickMeta = async (file) => {
+    if (!file) return;
+    setMetaName(file.name);
+    metaBufRef.current = await file.arrayBuffer();
+  };
+
+  const pickBin = async (file) => {
+    if (!file) return;
+    setBinName(file.name);
+    binBufRef.current = await file.arrayBuffer();
+  };
+
+  const run = () => {
+    if (!metaBufRef.current) {
+      setError("global-metadata.dat is required. The binary is optional but needed for type names and method addresses.");
+      setStatus("error");
+      return;
+    }
+    setStatus("loading");
+    setError("");
+    setTimeout(() => {
+      try {
+        const res = analyzeMetadata({
+          metadata: metaBufRef.current,
+          binary: binBufRef.current,
+        });
+        setResult(res);
+        setTab("dump");
+        setStatus("done");
+      } catch (e) {
+        setError(e && e.stack ? e.stack : String(e));
+        setStatus("error");
+      }
+    }, 30);
+  };
+
+  const download = (filename, content, type) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([content], { type: type || "text/plain" }));
+    a.download = filename;
+    a.click();
+  };
+
+  const currentTabContent = () => {
+    if (!result || !result.ok) return "";
+    switch (tab) {
+      case "dump": return result.dumpCs;
+      case "strings": return result.stringsDump;
+      case "methods": return result.methodTableDump;
+      case "json": return result.jsonDump;
+      default: return "";
+    }
+  };
+
+  const tabs = [
+    { id: "dump", label: "dump.cs" },
+    { id: "strings", label: "strings" },
+    { id: "methods", label: "methods" },
+    { id: "json", label: "json" },
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", background: palette.bg, padding: "40px 24px", maxWidth: 1000, margin: "0 auto" }}>
+      <button className="nav-back" onClick={onBack}>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 18 9 12 15 6"/></svg>
+        back
+      </button>
+
+      <div style={{ marginBottom: 32 }}>
+        <p style={{ fontFamily: "'JetBrains Mono'", fontSize: 11, color: palette.green, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 8 }}>global-metadata dumper</p>
+        <h1 style={{ fontSize: 28, fontWeight: 600, color: palette.text, marginBottom: 8 }}>dump your global-metadata.dat</h1>
+        <p style={{ color: palette.muted, fontSize: 14 }}>drop global-metadata.dat (required) + GameAssembly.dll / libil2cpp.so (optional, for type names &amp; method addresses)</p>
+      </div>
+
+      <div style={{ display: "flex", gap: 12, marginBottom: 24, flexWrap: "wrap", alignItems: "center" }}>
+        <div className="file-chip" onClick={() => metaRef.current.click()} title="click to browse">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <span>{metaName || "global-metadata.dat"}</span>
+        </div>
+        <div className="file-chip" onClick={() => binRef.current.click()} title="optional — click to browse">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M8 7V5a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+          <span>{binName || "binary (optional)"}</span>
+        </div>
+        <button className="btn btn-green" onClick={run} disabled={status === "loading"}>
+          {status === "loading" ? "dumping..." : "dump it"}
+        </button>
+        <input ref={metaRef} type="file" style={{ display: "none" }} onChange={e => pickMeta(e.target.files[0])} />
+        <input ref={binRef} type="file" accept=".dll,.so,.dylib,*" style={{ display: "none" }} onChange={e => pickBin(e.target.files[0])} />
+      </div>
+
+      {status === "error" && (
+        <div style={{ background: "#1f0f0f", border: `1px solid #4a1515`, borderRadius: 8, padding: "12px 16px", marginBottom: 24, maxHeight: 240, overflow: "auto" }}>
+          <p style={{ color: palette.danger, fontSize: 13, fontFamily: "'JetBrains Mono'", whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{error}</p>
+        </div>
+      )}
+
+      {status === "done" && result && result.ok && (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, marginBottom: 16 }}>
+            <div className="stat-box">
+              <div className="stat-label">metadata version</div>
+              <div className="stat-value">v{result.info.version}</div>
+            </div>
+            <div className="stat-box">
+              <div className="stat-label">unity</div>
+              <div className="stat-value" style={{ fontSize: 13 }}>{result.info.versionLabel}</div>
+            </div>
+            <div className="stat-box">
+              <div className="stat-label">types</div>
+              <div className="stat-value">{result.typeDefs.length.toLocaleString()}</div>
+            </div>
+            <div className="stat-box">
+              <div className="stat-label">methods</div>
+              <div className="stat-value">{result.methodDefs.length.toLocaleString()}</div>
+            </div>
+            <div className="stat-box">
+              <div className="stat-label">addresses</div>
+              <div className="stat-value">{result.methodAddresses.size.toLocaleString()}</div>
+            </div>
+            <div className="stat-box">
+              <div className="stat-label">binary</div>
+              <div className="stat-value" style={{ fontSize: 13 }}>
+                {result.info.binaryType ? `${result.info.binaryType}${result.info.is64 ? "64" : "32"}` : "none"}
+              </div>
+            </div>
+          </div>
+
+          {result.warnings.length > 0 && (
+            <div className="warning-box" style={{ marginBottom: 16 }}>
+              {result.warnings.map((w, i) => <div key={i}>⚠ {w}</div>)}
+            </div>
+          )}
+
+          <div className="dumper-tabs">
+            {tabs.map(t => (
+              <button key={t.id} className={`dumper-tab${tab === t.id ? " active" : ""}`} onClick={() => setTab(t.id)}>{t.label}</button>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginBottom: 8 }}>
+            <button className="btn" onClick={() => download(`dump.cs`, result.dumpCs)}>dump.cs</button>
+            <button className="btn" onClick={() => download(`strings.txt`, result.stringsDump)}>strings.txt</button>
+            <button className="btn" onClick={() => download(`methods.tsv`, result.methodTableDump)}>methods.tsv</button>
+            <button className="btn" onClick={() => download(`dump.json`, result.jsonDump)}>dump.json</button>
+          </div>
+
+          <div className="dump-view">{currentTabContent()}</div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
   const [page, setPage] = useState("home");
@@ -597,6 +809,7 @@ export default function App() {
       <style>{css}</style>
       {page === "home" && <HomePage onNav={setPage} />}
       {page === "symbols" && <SymbolGetter onBack={() => setPage("home")} />}
+      {page === "metadata" && <MetadataDumper onBack={() => setPage("home")} />}
       {page === "frida" && <FridaPatcher onBack={() => setPage("home")} />}
     </>
   );
