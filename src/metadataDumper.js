@@ -562,6 +562,9 @@ export function analyzeMetadata({ metadata, binary }) {
     const b = sectionBounds(name, offField, sizeField);
     if (!b.valid || itemSize <= 0) return [];
     const count = Math.floor(b.size / itemSize);
+    if (b.size % itemSize !== 0) {
+      warnings.push(`${name} section size (${b.size}) is not a multiple of the ${itemSize}-byte element size; ${b.size % itemSize} trailing bytes ignored. Some entries may be missing or the detected metadata version may be wrong.`);
+    }
     const out = new Array(count);
     for (let i = 0; i < count; i++) out[i] = builder(mdv, b.off, i);
     return out;
@@ -1494,23 +1497,22 @@ function buildDumps(result) {
     byImage.get(key).push(td);
   }
 
+  const childrenOf = new Map();
+  for (const td of result.typeDefs) {
+    if (td.declaringTypeIndex >= 0) {
+      if (!childrenOf.has(td.declaringTypeIndex)) childrenOf.set(td.declaringTypeIndex, []);
+      childrenOf.get(td.declaringTypeIndex).push(td);
+    }
+  }
+
   for (const [imgIdx, typeList] of byImage) {
     if (imgIdx >= 0 && imgIdx < result.images.length) {
       lines.push(`// Image: ${result.images[imgIdx].name}`);
     } else {
       lines.push('// Image: <unknown>');
     }
-    const byNamespace = new Map();
-    for (const td of typeList) {
-      if (td.declaringTypeIndex >= 0) continue;
-      if (!byNamespace.has(td.namespace)) byNamespace.set(td.namespace, []);
-      byNamespace.get(td.namespace).push(td);
-    }
-    for (const [ns, tds] of byNamespace) {
-      if (ns) lines.push(`namespace ${ns}`);
-      if (ns) lines.push('{');
-      const indent = ns ? '    ' : '';
-      for (const td of tds) {
+    const renderType = (td, indent) => {
+      try {
         const access = TYPE_ACCESS[(td.flags & 0x7) || 0] || 'private';
         const isStruct = td.bitfield !== undefined && ((td.bitfield >> 31) & 1) === 1;
         const baseName = td.parentIndex >= 0 ? resolvers.typeDefName(td.parentIndex) : null;
@@ -1598,10 +1600,26 @@ function buildDumps(result) {
           const line = `${indent}    ${acc}${mods ? ' ' + mods : ''} ${ret} ${m.name}${generics}(${ps}) { } // ${suffix}`;
           lines.push(line);
         }
+        const kids = childrenOf.get(td.index) || [];
+        for (const kid of kids) renderType(kid, indent + '    ');
         lines.push(`${indent}}`);
-        if (ns) lines.push('}');
-        lines.push('');
+      } catch (err) {
+        lines.push(`${indent}// failed to render type ${td.namespace ? td.namespace + '.' + td.name : td.name}: ${err && err.message}`);
       }
+    };
+    const byNamespace = new Map();
+    for (const td of typeList) {
+      if (td.declaringTypeIndex >= 0) continue;
+      if (!byNamespace.has(td.namespace)) byNamespace.set(td.namespace, []);
+      byNamespace.get(td.namespace).push(td);
+    }
+    for (const [ns, tds] of byNamespace) {
+      if (ns) lines.push(`namespace ${ns}`);
+      if (ns) lines.push('{');
+      const indent = ns ? '    ' : '';
+      for (const td of tds) renderType(td, indent);
+      if (ns) lines.push('}');
+      lines.push('');
     }
   }
 
