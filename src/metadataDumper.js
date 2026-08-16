@@ -506,6 +506,101 @@ function locateHeader(dv, warnings) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Magic-less header detection (obfuscated / magic-stripped files)     */
+/* ------------------------------------------------------------------ */
+
+const KNOWN_METADATA_VERSIONS = [24.0, 24.1, 24.2, 24.3, 24.4, 24.5, 27, 27.1, 27.2, 27.3, 29, 29.1, 29.2, 31];
+
+const HEADER_PROBE_PAIRS = 20; // pairs 0..19 are at fixed positions in every version 24-31
+
+function scoreHeaderCandidate(dv, c) {
+  const fileSize = dv.byteLength;
+  const slOff = dv.getUint32(c + 8, true);
+  if (slOff === undefined || slOff < c + 160 || slOff >= fileSize) return -1;
+  let prevEnd = slOff;
+  let score = 12;
+  for (let i = 0; i < HEADER_PROBE_PAIRS; i++) {
+    const o = dv.getUint32(c + 8 + i * 8, true);
+    const s = dv.getInt32(c + 8 + i * 8 + 4, true);
+    if (o === undefined || s === undefined || s < 0 || o < prevEnd || o + s > fileSize) return -1;
+    score += 2;
+    if (o - prevEnd <= 4) score += 1;
+    prevEnd = o + s;
+  }
+  const slSize = dv.getInt32(c + 8 + 4, true);
+  if (slSize >= 0 && slSize % 8 === 0) score += 3;
+  const methodsSize = dv.getInt32(c + 8 + 5 * 8 + 4, true);
+  if (methodsSize > 0) score += 4;
+  const tdSize = dv.getInt32(c + 8 + 19 * 8 + 4, true);
+  if (tdSize > 0) score += 4;
+  const stringSize = dv.getInt32(c + 8 + 2 * 8 + 4, true);
+  if (stringSize > 0) score += 2;
+  return score;
+}
+
+function determineVersionByStructure(dv, headerOff) {
+  const raw = dv.getUint32(headerOff + 4, true);
+  const observedHeaderSize = dv.getUint32(headerOff + 8, true) - headerOff;
+  if (raw !== undefined && raw >= 16 && raw <= 50 && gatedSize(HEADER_FIELDS, raw) + 8 === observedHeaderSize) {
+    return { version: raw, fromWord: true };
+  }
+  let best = null;
+  let bestScore = -1;
+  for (const v of KNOWN_METADATA_VERSIONS) {
+    if (gatedSize(HEADER_FIELDS, v) + 8 !== observedHeaderSize) continue;
+    const tdSize = dv.getInt32(headerOff + 8 + 19 * 8 + 4, true);
+    const mSize = dv.getInt32(headerOff + 8 + 5 * 8 + 4, true);
+    const pSize = dv.getInt32(headerOff + 8 + 10 * 8 + 4, true);
+    const fSize = dv.getInt32(headerOff + 8 + 11 * 8 + 4, true);
+    let score = 0;
+    const tdS = gatedSize(TYPE_DEF_FIELDS, v);
+    const mS = gatedSize(METHOD_DEF_FIELDS, v);
+    const pS = gatedSize(PARAMETER_DEF_FIELDS, v);
+    const fS = gatedSize(FIELD_DEF_FIELDS, v);
+    if (tdS > 0 && tdSize > 0 && tdSize % tdS === 0) score += 4;
+    if (mS > 0 && mSize > 0 && mSize % mS === 0) score += 4;
+    if (pS > 0 && pSize > 0 && pSize % pS === 0) score += 4;
+    if (fS > 0 && fSize > 0 && fSize % fS === 0) score += 4;
+    if (score >= bestScore) {
+      bestScore = score;
+      best = v;
+    }
+  }
+  return best === null ? null : { version: best, fromWord: false };
+}
+
+function locateHeaderByStructure(dv, warnings) {
+  const fileSize = dv.byteLength;
+  if (fileSize < 512) return null;
+  let best = null;
+  let bestScore = 0;
+  for (let p = 0; p + 4 <= fileSize; p += 4) {
+    const v = dv.getUint32(p, true);
+    if (v < 160 || v >= fileSize) continue;
+    const c = p - 8;
+    if (c < 0 || c + 8 + HEADER_PROBE_PAIRS * 8 > fileSize) continue;
+    const methodsSize = dv.getInt32(c + 8 + 5 * 8 + 4, true);
+    const tdSize = dv.getInt32(c + 8 + 19 * 8 + 4, true);
+    if (!(methodsSize > 0) || !(tdSize > 0)) continue;
+    const score = scoreHeaderCandidate(dv, c);
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+    if (score > 60) break;
+  }
+  if (best === null) return null;
+  const det = determineVersionByStructure(dv, best);
+  warnings.push('Metadata header located by structure — the magic bytes are missing (obfuscated/stripped file).');
+  if (det === null) {
+    warnings.push('Could not determine the metadata version from the stripped header; defaulting to v29 (2021.x) layout.');
+    return { headerOff: best, version: 29, magic: 0, stripped: true, versionFromWord: false };
+  }
+  if (!det.fromWord) warnings.push(`Metadata version ${det.version} determined from the stripped header layout.`);
+  return { headerOff: best, version: det.version, magic: 0, stripped: true, versionFromWord: det.fromWord };
+}
+
+/* ------------------------------------------------------------------ */
 /* Main analysis                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -513,7 +608,10 @@ export function analyzeMetadata({ metadata, binary }) {
   const warnings = new WarningCollector();
   const mdv = new DataView(metadata);
 
-  const probe = locateHeader(mdv, warnings);
+  let probe = locateHeader(mdv, warnings);
+  if (!probe) {
+    probe = locateHeaderByStructure(mdv, warnings);
+  }
   if (!probe) {
     return {
       ok: false,
@@ -522,7 +620,7 @@ export function analyzeMetadata({ metadata, binary }) {
     };
   }
 
-  let vf = detectVersion(mdv, probe, warnings);
+  let vf = probe.versionFromWord ? detectVersion(mdv, probe, warnings) : probe.version;
   const headerOff = probe.headerOff;
   const headerSize = gatedSize(HEADER_FIELDS, vf) + 8;
 
