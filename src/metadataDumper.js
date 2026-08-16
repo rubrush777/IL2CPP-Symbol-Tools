@@ -863,23 +863,39 @@ export function analyzeMetadata({ metadata, binary }) {
 
   /* --- metadata registration search (binary types + field offsets) --- */
   if (bin) {
-    const reg = searchMetadataRegistration(bin, result, vf, warnings);
-    if (reg) {
-      result.registration = reg;
-      result.typesArray = parseTypesArray(bin, reg);
-      result.fieldOffsets = parseFieldOffsets(bin, reg, result, vf, warnings);
-    } else {
-      warnings.push('Could not locate the metadata registration (types/field offsets). Type signatures will be best-effort.');
+    try {
+      const reg = searchMetadataRegistration(bin, result, vf, warnings);
+      if (reg) {
+        result.registration = reg;
+        result.typesArray = parseTypesArray(bin, reg);
+        result.fieldOffsets = parseFieldOffsets(bin, reg, result, vf, warnings);
+      } else {
+        warnings.push('Could not locate the metadata registration (types/field offsets). Type signatures will be best-effort.');
+      }
+    } catch (e) {
+      warnings.push('Metadata registration search failed: ' + (e && e.message));
     }
   }
 
   /* --- codegen modules (method addresses) --- */
   if (bin) {
-    result.modules = findCodeGenModules(bin, result, warnings);
-    resolveMethodAddresses(result, warnings);
+    try {
+      result.modules = findCodeGenModules(bin, result, warnings);
+      resolveMethodAddresses(result, warnings);
+    } catch (e) {
+      warnings.push('Method address resolution failed: ' + (e && e.message));
+    }
   }
 
-  buildDumps(result);
+  try {
+    buildDumps(result);
+  } catch (e) {
+    warnings.push('Failed to build dumps: ' + (e && e.message));
+    result.dumpCs = '// Failed to build dumps: ' + (e && e.message);
+    result.stringsDump = '';
+    result.methodTableDump = '';
+    result.jsonDump = '';
+  }
 
   return {
     ok: true,

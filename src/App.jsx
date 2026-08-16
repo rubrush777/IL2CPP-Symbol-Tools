@@ -644,43 +644,51 @@ function MetadataDumper({ onBack }) {
   const metaRef = useRef();
   const binRef = useRef();
 
-  const metaBufRef = useRef(null);
-  const binBufRef = useRef(null);
+  const metaFileRef = useRef(null);
+  const binFileRef = useRef(null);
 
-  const pickMeta = async (file) => {
+  const pickMeta = (file) => {
     if (!file) return;
     setMetaName(file.name);
-    metaBufRef.current = await file.arrayBuffer();
+    metaFileRef.current = file;
   };
 
-  const pickBin = async (file) => {
+  const pickBin = (file) => {
     if (!file) return;
     setBinName(file.name);
-    binBufRef.current = await file.arrayBuffer();
+    binFileRef.current = file;
   };
 
-  const run = () => {
-    if (!metaBufRef.current) {
+  const run = async () => {
+    if (!metaFileRef.current) {
       setError("global-metadata.dat is required. The binary is optional but needed for type names and method addresses.");
       setStatus("error");
       return;
     }
     setStatus("loading");
     setError("");
-    setTimeout(() => {
-      try {
-        const res = analyzeMetadata({
-          metadata: metaBufRef.current,
-          binary: binBufRef.current,
-        });
-        setResult(res);
-        setTab("dump");
-        setStatus("done");
-      } catch (e) {
-        setError(e && e.stack ? e.stack : String(e));
+    try {
+      const [metaBuf, binBuf] = await Promise.all([
+        metaFileRef.current.arrayBuffer(),
+        binFileRef.current ? binFileRef.current.arrayBuffer() : Promise.resolve(null),
+      ]);
+      const res = analyzeMetadata({
+        metadata: metaBuf,
+        binary: binBuf,
+      });
+      if (res && res.ok === false) {
+        const errMsg = (res.error || "dump failed") + (res.warnings && res.warnings.length ? "\n\nWarnings:\n- " + res.warnings.join("\n- ") : "");
+        setError(errMsg);
         setStatus("error");
+        return;
       }
-    }, 30);
+      setResult(res);
+      setTab("dump");
+      setStatus("done");
+    } catch (e) {
+      setError(e && e.stack ? e.stack : String(e));
+      setStatus("error");
+    }
   };
 
   const download = (filename, content, type) => {
